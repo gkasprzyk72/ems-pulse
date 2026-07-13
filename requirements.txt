@@ -3,3 +3,5 @@ flask-cors
 feedparser
 requests
 gunicorn
+beautifulsoup4
+python-dateutil
