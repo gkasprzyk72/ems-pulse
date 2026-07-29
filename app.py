@@ -4,6 +4,7 @@ import feedparser
 import datetime
 import re
 import time
+import os
 import threading
 import requests
 from dateutil import parser as dateparser
@@ -27,7 +28,7 @@ OIG_TYPES = [
     "cmp-and-affirmative-exclusions",
     "criminal-and-civil-actions",
 ]
-OIG_PAGES_PER_TYPE = 2  # most recent ~40 entries per type, per refresh
+OIG_PAGES_PER_TYPE = 2
 
 OIG_KEYWORDS = [
     "ambulance", "paramedic", "emt", "emergency medical",
@@ -54,7 +55,7 @@ OIG_LINK_RE = re.compile(r'^/fraud/enforcement/[a-z0-9\-]+/?$')
 
 _oig_cache = {"data": None, "timestamp": 0}
 _oig_lock = threading.Lock()
-OIG_CACHE_TTL = 6 * 60 * 60  # 6 hours
+OIG_CACHE_TTL = 6 * 60 * 60
 
 
 def _list_oig_entries():
@@ -65,8 +66,7 @@ def _list_oig_entries():
             params = [("type", t) for t in OIG_TYPES]
             params.append(("page", page))
             resp = requests.get(
-                OIG_BASE,
-                params=params,
+                OIG_BASE, params=params,
                 headers={"User-Agent": "Mozilla/5.0 (compatible; EMSPulseBot/1.0)"},
                 timeout=15,
             )
@@ -82,7 +82,6 @@ def _list_oig_entries():
                 url = href if href.startswith("http") else f"https://oig.hhs.gov{href}"
                 if url in entries:
                     continue
-
                 container = a
                 context_text = ""
                 for _ in range(5):
@@ -92,22 +91,16 @@ def _list_oig_entries():
                     context_text = container.get_text(" ", strip=True)
                     if OIG_DATE_RE.search(context_text):
                         break
-
                 date_match = OIG_DATE_RE.search(context_text)
                 date_str = date_match.group(0) if date_match else ""
                 try:
                     parsed_date = dateparser.parse(date_str, fuzzy=True).isoformat() if date_str else ""
                 except Exception:
                     parsed_date = ""
-
                 found_types = [t for t in OIG_TYPE_LABELS if t in context_text]
-
                 entries[url] = {
-                    "title": title,
-                    "url": url,
-                    "date": date_str,
-                    "publishedAt": parsed_date,
-                    "types": found_types,
+                    "title": title, "url": url, "date": date_str,
+                    "publishedAt": parsed_date, "types": found_types,
                 }
         except Exception as e:
             print(f"Error listing OIG page {page}: {e}")
@@ -122,9 +115,7 @@ def _matches_keywords(text):
 def _fetch_detail_snippet(url):
     try:
         resp = requests.get(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; EMSPulseBot/1.0)"},
-            timeout=15,
+            url, headers={"User-Agent": "Mozilla/5.0 (compatible; EMSPulseBot/1.0)"}, timeout=15,
         )
         if resp.status_code != 200:
             return ""
@@ -147,13 +138,11 @@ def _fetch_oig_articles():
             entry["matched_on"] = "title"
             matched.append(entry)
             continue
-
         body = _fetch_detail_snippet(entry["url"])
         if body and _matches_keywords(body):
             entry["summary"] = body[:300]
             entry["matched_on"] = "body"
             matched.append(entry)
-
     matched.sort(key=lambda x: x["publishedAt"] or "", reverse=True)
     return matched
 
@@ -169,6 +158,138 @@ def get_oig():
         articles = _oig_cache["data"]
         cached_at = _oig_cache["timestamp"]
     return jsonify({"articles": articles, "count": len(articles), "cached_at": cached_at})
+
+# ---------- Congress Tracker ----------
+
+CONGRESS_API_KEY = os.environ.get("CONGRESS_API_KEY", "")
+CONGRESS_BASE = "https://api.congress.gov/v3"
+CONGRESS_NUM = "119"
+
+WATCHLIST = [
+    {"congress": "119", "type": "hr", "number": "9970", "label": "RESCUE Act of 2026 (H.R. 9970)"},
+    {"congress": "119", "type": "hr", "number": "3443", "label": "When Minutes Count for Emergency Medical Patients Act (H.R. 3443)"},
+    {"congress": "119", "type": "hr", "number": "4792", "label": "Protecting Air Ambulance Services for Americans Act of 2025 (H.R. 4792)"},
+    {"congress": "119", "type": "hr", "number": "2232", "label": "Protecting Access to Ground Ambulance Medical Services Act of 2025 (H.R. 2232)"},
+    {"congress": "119", "type": "hr", "number": "9212", "label": "VA Emergency Transportation Act (H.R. 9212)"},
+    {"congress": "119", "type": "hr", "number": "7277", "label": "EMS Reimbursement for On-Scene and Support Act (H.R. 7277)"},
+    {"congress": "119", "type": "s", "number": "3730", "label": "EMS Reimbursement for On-Scene Care and Support Act (S. 3730)"},
+    {"congress": "119", "type": "s", "number": "1643", "label": "Protecting Access to Ground Ambulance Medical Services Act of 2025 (S. 1643)"},
+]
+
+CONGRESS_KEYWORDS = [
+    "ambulance", "paramedic", "emt", "emergency medical",
+    "ground ambulance", "air ambulance", "gemt", "ems provider",
+    "ems agency", "fire department",
+]
+
+_congress_cache = {"data": None, "timestamp": 0}
+_congress_lock = threading.Lock()
+CONGRESS_CACHE_TTL = 12 * 60 * 60  # 12 hours
+
+
+def _congress_get(path, params=None):
+    params = dict(params or {})
+    params["api_key"] = CONGRESS_API_KEY
+    params["format"] = "json"
+    resp = requests.get(f"{CONGRESS_BASE}{path}", params=params, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _bill_congress_url(congress, btype, number):
+    chamber_slug = "house-bill" if btype.lower() == "hr" else "senate-bill" if btype.lower() == "s" else btype.lower()
+    return f"https://www.congress.gov/bill/{congress}th-congress/{chamber_slug}/{number}"
+
+
+def _fetch_watchlist():
+    items = []
+    for w in WATCHLIST:
+        try:
+            data = _congress_get(f"/bill/{w['congress']}/{w['type']}/{w['number']}")
+            bill = data.get("bill", {})
+            latest = bill.get("latestAction", {}) or {}
+            sponsors = bill.get("sponsors") or []
+            sponsor_name = sponsors[0].get("fullName", "") if sponsors else ""
+            cosponsors = bill.get("cosponsors") or {}
+            items.append({
+                "label": w["label"],
+                "title": bill.get("title", w["label"]),
+                "congress": w["congress"],
+                "type": w["type"].upper(),
+                "number": w["number"],
+                "introducedDate": bill.get("introducedDate", ""),
+                "latestActionDate": latest.get("actionDate", ""),
+                "latestActionText": latest.get("text", ""),
+                "sponsor": sponsor_name,
+                "cosponsorCount": cosponsors.get("count"),
+                "url": _bill_congress_url(w["congress"], w["type"], w["number"]),
+                "matched_on": "watchlist",
+            })
+        except Exception as e:
+            print(f"Error fetching watchlist bill {w}: {e}")
+    return items
+
+
+def _matches_congress_keywords(text):
+    t = (text or "").lower()
+    return any(kw in t for kw in CONGRESS_KEYWORDS)
+
+
+def _fetch_recent_scan(limit=100):
+    items = []
+    try:
+        data = _congress_get(f"/bill/{CONGRESS_NUM}", params={"sort": "updateDate desc", "limit": limit})
+        bills = data.get("bills", [])
+        for b in bills:
+            title = b.get("title", "") or ""
+            if not _matches_congress_keywords(title):
+                continue
+            btype = (b.get("type") or "").lower()
+            bnum = str(b.get("number", ""))
+            latest = b.get("latestAction") or {}
+            items.append({
+                "label": f"{b.get('type','')} {bnum}",
+                "title": title,
+                "congress": str(b.get("congress", CONGRESS_NUM)),
+                "type": b.get("type", ""),
+                "number": bnum,
+                "introducedDate": b.get("introducedDate", ""),
+                "latestActionDate": latest.get("actionDate", ""),
+                "latestActionText": latest.get("text", ""),
+                "sponsor": "",
+                "cosponsorCount": None,
+                "url": _bill_congress_url(b.get("congress", CONGRESS_NUM), btype, bnum),
+                "matched_on": "keyword-scan",
+            })
+    except Exception as e:
+        print(f"Error scanning recent bills: {e}")
+    return items
+
+
+def _fetch_congress_data():
+    if not CONGRESS_API_KEY:
+        print("CONGRESS_API_KEY not set — skipping congress fetch")
+        return []
+    watchlist_items = _fetch_watchlist()
+    scan_items = _fetch_recent_scan()
+    watch_keys = {(w["congress"], w["type"].lower(), w["number"]) for w in watchlist_items}
+    scan_items = [s for s in scan_items if (s["congress"], s["type"].lower(), s["number"]) not in watch_keys]
+    all_items = watchlist_items + scan_items
+    all_items.sort(key=lambda x: x.get("latestActionDate") or x.get("introducedDate") or "", reverse=True)
+    return all_items
+
+
+@app.route("/congress")
+def get_congress():
+    now = time.time()
+    with _congress_lock:
+        stale = _congress_cache["data"] is None or (now - _congress_cache["timestamp"]) > CONGRESS_CACHE_TTL
+        if stale:
+            _congress_cache["data"] = _fetch_congress_data()
+            _congress_cache["timestamp"] = now
+        bills = _congress_cache["data"]
+        cached_at = _congress_cache["timestamp"]
+    return jsonify({"bills": bills, "count": len(bills), "cached_at": cached_at})
 
 # ---------- News Scanner (existing) ----------
 
